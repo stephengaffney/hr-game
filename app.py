@@ -23,7 +23,7 @@ from supabase import create_client, Client
 from pywebpush import webpush, WebPushException
 
 app = Flask(__name__)
-CORS(app, origins=["https://going-yard.vercel.app", "http://localhost:3000"])
+CORS(app, origins=["https://going-yard-frontend.vercel.app", "http://localhost:3000"])
 
 # ---------------------------------------------------------------------------
 # Config — set these as environment variables in Railway
