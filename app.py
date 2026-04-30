@@ -106,6 +106,10 @@ def send_push_to_all(title: str, body: str, data: dict = None):
         print(f"[PUSH] Could not fetch subscriptions: {e}")
         return
 
+    if not subs.data:
+        print("[PUSH] No subscriptions found")
+        return
+
     payload = json.dumps({
         "title": title,
         "body":  body,
@@ -127,14 +131,18 @@ def send_push_to_all(title: str, body: str, data: dict = None):
                 vapid_claims={
                     "sub": VAPID_EMAIL,
                     "exp": int(datetime.now(timezone.utc).timestamp()) + 86400
-                }
+                },
+                content_encoding="aes128gcm",
             )
+            print(f"[PUSH] Sent to {sub['username']}")
         except WebPushException as e:
             if e.response and e.response.status_code == 410:
-                # Subscription expired — remove it
                 supabase.table("push_subscriptions").delete().eq("endpoint", sub["endpoint"]).execute()
+                print(f"[PUSH] Removed expired subscription for {sub['username']}")
             else:
                 print(f"[PUSH] Failed for {sub['username']}: {e}")
+        except Exception as e:
+            print(f"[PUSH] Unexpected error for {sub['username']}: {e}")
 
 
 # ---------------------------------------------------------------------------
