@@ -14,8 +14,22 @@ Deploy to Railway:
 
 import os
 import json
+import random
 from datetime import datetime, timezone
 from functools import wraps
+
+HR_SLOGANS = [
+    "Gone! See ya!",
+    "That ball is OUTTA HERE!",
+    "No doubt about it — GONE!",
+    "He got ALL of that one!",
+    "That one left the zip code!",
+    "He tattooed that baseball!",
+    "DEEP to center — it is GONE!",
+    "Dinger!",
+    "Absolute Tank!",
+    "See ya, ball!",
+]
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -183,6 +197,7 @@ def hr_webhook():
 
     # Insert HR event
     try:
+        slogan = random.choice(HR_SLOGANS)
         event_res = supabase.table("hr_events").insert({
             "player_key": player_key,
             "full_name":  full_name,
@@ -191,6 +206,7 @@ def hr_webhook():
             "new_hrs":    new_hrs,
             "drink_type": drink_type,
             "drinker":    drinker,
+            "slogan":     slogan,
         }).execute()
         event_id = event_res.data[0]["id"]
     except Exception as e:
@@ -212,10 +228,10 @@ def hr_webhook():
     # Push notification
     if drink_type == "i_drink":
         push_title = f"⚾ {full_name} went yard!"
-        push_body  = f"{drinker.capitalize()} drinks {count} {beer_word}!"
+        push_body  = f"{slogan} {drinker.capitalize()} drinks {count} {beer_word}!"
     else:
         push_title = f"⚾ {full_name} went yard!"
-        push_body  = f"{drinker.capitalize()} must assign {count} {beer_word}!"
+        push_body  = f"{slogan} {drinker.capitalize()} must assign {count} {beer_word}!"
 
     send_push_to_all(push_title, push_body, {
         "event_id":   event_id,
