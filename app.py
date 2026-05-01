@@ -5,17 +5,12 @@ backend/app.py
 Going Yard & Drinking Hard — Flask Backend API
 Receives HR events from hr_poller.py, stores in Supabase,
 and sends Web Push notifications to all subscribed users.
-
-Deploy to Railway:
-  1. Push this folder to GitHub
-  2. Connect repo to Railway
-  3. Set environment variables in Railway dashboard
 """
 
 import os
 import json
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 HR_SLOGANS = [
@@ -40,7 +35,7 @@ app = Flask(__name__)
 CORS(app, origins=["https://going-yard-frontend.vercel.app", "http://localhost:3000"])
 
 # ---------------------------------------------------------------------------
-# Config — set these as environment variables in Railway
+# Config
 # ---------------------------------------------------------------------------
 SUPABASE_URL          = os.environ.get("SUPABASE_URL", "https://rhqyfjikjkwrzzhttuwq.supabase.co")
 SUPABASE_SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -52,7 +47,7 @@ WEBHOOK_SECRET        = os.environ.get("WEBHOOK_SECRET", "gyard_secret_2026")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ---------------------------------------------------------------------------
-# Player → user matchup (mirrors hr_poller.py)
+# Player → user matchup
 # ---------------------------------------------------------------------------
 PLAYER_MATCHUP = {
     "Diaz":      ("frank",   "i_drink"),
@@ -71,13 +66,14 @@ PLAYER_MATCHUP = {
     "McMahon":   ("dan",     "i_drink"),
 }
 
+LATE_HOURS = 24  # hours before a drink is considered late
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
 def require_webhook_secret(f):
-    """Decorator to protect webhook endpoint from unauthorized callers."""
     @wraps(f)
     def decorated(*args, **kwargs):
         secret = request.headers.get("X-Webhook-Secret")
@@ -88,7 +84,6 @@ def require_webhook_secret(f):
 
 
 def require_auth(f):
-    """Decorator to verify Supabase JWT on protected endpoints."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
@@ -109,7 +104,6 @@ def require_auth(f):
 # ---------------------------------------------------------------------------
 
 def send_push_to_all(title: str, body: str, data: dict = None):
-    """Send a Web Push notification to all subscribed users."""
     if not VAPID_PRIVATE_KEY:
         print("[PUSH] VAPID_PRIVATE_KEY not set — skipping push")
         return
@@ -160,6 +154,35 @@ def send_push_to_all(title: str, body: str, data: dict = None):
 
 
 # ---------------------------------------------------------------------------
+# Late status helper — call periodically or on fetch to mark overdue drinks
+# ---------------------------------------------------------------------------
+
+def refresh_late_statuses():
+    """
+    Finds all drink_log entries that are still pending/awaiting_approval
+    and have been open for more than LATE_HOURS. Marks them as 'late'.
+
+    drink_log has no created_at — we compare event_date (DATE string)
+    against today's date minus LATE_HOURS (i.e. yesterday).
+    """
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(hours=LATE_HOURS)).strftime("%Y-%m-%d")
+    try:
+        overdue = (
+            supabase.table("drink_log")
+            .select("id, hr_event_id, username")
+            .in_("status", ["pending", "awaiting_approval"])
+            .lt("event_date", cutoff_date)
+            .execute()
+        )
+        if overdue.data:
+            ids = [r["id"] for r in overdue.data]
+            supabase.table("drink_log").update({"status": "late"}).in_("id", ids).execute()
+            print(f"[LATE] Marked {len(ids)} drink(s) as late")
+    except Exception as e:
+        print(f"[LATE] Error refreshing late statuses: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Webhook — called by hr_poller.py on every new HR
 # ---------------------------------------------------------------------------
 
@@ -168,18 +191,7 @@ def send_push_to_all(title: str, body: str, data: dict = None):
 def hr_webhook():
     """
     Receives HR event from hr_poller.py.
-    Stores in hr_events + drink_log, sends push notifications.
-
-    Expected JSON:
-    {
-        "player_key": "Judge",
-        "full_name": "Aaron Judge",
-        "team": "NYY",
-        "old_hrs": 3,
-        "new_hrs": 4,
-        "drinker": "dan",
-        "drink_type": "you_drink"
-    }
+    Stores in hr_events + drink_log (status='pending'), sends push notifications.
     """
     data = request.json
     if not data:
@@ -212,7 +224,7 @@ def hr_webhook():
     except Exception as e:
         return jsonify({"error": f"Failed to insert hr_event: {e}"}), 500
 
-    # Insert drink log entry
+    # Insert drink log entry — always starts as 'pending'
     try:
         supabase.table("drink_log").insert({
             "hr_event_id": event_id,
@@ -220,7 +232,8 @@ def hr_webhook():
             "username":    drinker,
             "mlb_player":  full_name,
             "drink_type":  drink_type,
-            "given_to":    None,   # filled in later if you_drink and assigned
+            "given_to":    None,
+            "status":      "pending",
         }).execute()
     except Exception as e:
         print(f"[DB] Failed to insert drink_log: {e}")
@@ -240,6 +253,9 @@ def hr_webhook():
         "drinker":    drinker,
     })
 
+    # Refresh any newly-late drinks while we're here
+    refresh_late_statuses()
+
     return jsonify({"success": True, "event_id": event_id}), 201
 
 
@@ -253,43 +269,32 @@ def assign_drink():
     """
     Assigns a you_drink to another user.
     Only the matched drinker can assign, and only for their you_drink player.
-
-    Expected JSON:
-    {
-        "hr_event_id": 42,
-        "assignee": "scott",
-        "message": "Scotty boy ur up 🍺"
-    }
+    After assignment the drink_log status moves to 'awaiting_approval'.
     """
-    data       = request.json
+    data        = request.json
     hr_event_id = data.get("hr_event_id")
-    assignee   = data.get("assignee")
-    message    = data.get("message", "")
+    assignee    = data.get("assignee")
+    message     = data.get("message", "")
 
-    # Get the HR event
     try:
         event_res = supabase.table("hr_events").select("*").eq("id", hr_event_id).single().execute()
         event = event_res.data
     except Exception:
         return jsonify({"error": "HR event not found"}), 404
 
-    # Verify this is a you_drink event
     if event["drink_type"] != "you_drink":
         return jsonify({"error": "This is not a you_drink event"}), 400
 
-    # Verify the requesting user is the matched drinker
     profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
     username = profile_res.data["username"]
 
     if username.lower() != event["drinker"].lower():
         return jsonify({"error": "Only the matched player can assign this drink"}), 403
 
-    # Check not already assigned
     existing = supabase.table("drink_assignments").select("id").eq("hr_event_id", hr_event_id).execute()
     if existing.data:
         return jsonify({"error": "Drink already assigned"}), 400
 
-    # Create assignment
     try:
         assign_res = supabase.table("drink_assignments").insert({
             "hr_event_id": hr_event_id,
@@ -302,20 +307,109 @@ def assign_drink():
     except Exception as e:
         return jsonify({"error": f"Failed to create assignment: {e}"}), 500
 
-    # Update drink_log given_to
+    # Update drink_log: set given_to and move to awaiting_approval
     try:
-        supabase.table("drink_log").update({"given_to": assignee}).eq("hr_event_id", hr_event_id).execute()
+        supabase.table("drink_log").update({
+            "given_to": assignee,
+            "status":   "awaiting_approval",
+        }).eq("hr_event_id", hr_event_id).execute()
     except Exception as e:
-        print(f"[DB] Failed to update drink_log given_to: {e}")
+        print(f"[DB] Failed to update drink_log: {e}")
 
-    # Push notification
     send_push_to_all(
-        f"🍺 Drink Assigned!",
+        "🍺 Drink Assigned!",
         f"{username.capitalize()} assigned a drink to {assignee.capitalize()}! \"{message}\"",
         {"type": "assignment", "assignment_id": assignment_id}
     )
 
     return jsonify({"success": True, "assignment_id": assignment_id}), 201
+
+
+# ---------------------------------------------------------------------------
+# Drink approval  ← NEW
+# ---------------------------------------------------------------------------
+
+@app.route("/drinks/approve", methods=["POST"])
+@require_auth
+def approve_drink():
+    """
+    Marks a drink as completed (approved by another player).
+
+    Rules:
+      - The approver must NOT be the person who was supposed to drink.
+        • For i_drink:   the drinker is event.drinker
+        • For you_drink: the drinker is drink_log.given_to (the assignee)
+      - Only one approval needed; idempotent if already completed.
+
+    Expected JSON: { "drink_log_id": <int> }
+    """
+    data         = request.json
+    drink_log_id = data.get("drink_log_id")
+
+    if not drink_log_id:
+        return jsonify({"error": "drink_log_id required"}), 400
+
+    # Fetch the drink log entry
+    try:
+        dl_res = supabase.table("drink_log").select("*").eq("id", drink_log_id).single().execute()
+        dl = dl_res.data
+    except Exception:
+        return jsonify({"error": "Drink log entry not found"}), 404
+
+    if dl["status"] == "completed":
+        return jsonify({"success": True, "message": "Already completed"}), 200
+
+    # Who is the actual drinker for this entry?
+    # For i_drink → the drinker field; for you_drink → the given_to field
+    actual_drinker = (dl.get("given_to") or dl["username"]).lower()
+
+    # Get the approver's username
+    profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
+    approver = profile_res.data["username"].lower()
+
+    if approver == actual_drinker:
+        return jsonify({"error": "You cannot approve your own drink"}), 403
+
+    # Mark completed
+    try:
+        supabase.table("drink_log").update({
+            "status":      "completed",
+            "approved_by": approver,
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", drink_log_id).execute()
+    except Exception as e:
+        return jsonify({"error": f"Failed to approve drink: {e}"}), 500
+
+    # Also update the drink_assignments status if this is a you_drink
+    try:
+        if dl["drink_type"] == "you_drink" and dl.get("hr_event_id"):
+            supabase.table("drink_assignments").update({
+                "status": "completed"
+            }).eq("hr_event_id", dl["hr_event_id"]).execute()
+    except Exception as e:
+        print(f"[DB] Failed to update drink_assignment status: {e}")
+
+    # Notify everyone
+    drinker_display = actual_drinker.capitalize()
+    send_push_to_all(
+        "✅ Drink Confirmed!",
+        f"{approver.capitalize()} approved {drinker_display}'s drink. Bottoms up! 🍺",
+        {"type": "approval", "drink_log_id": drink_log_id}
+    )
+
+    return jsonify({"success": True, "approved_by": approver}), 200
+
+
+# ---------------------------------------------------------------------------
+# Late status refresh endpoint  ← NEW (callable by a cron or manually)
+# ---------------------------------------------------------------------------
+
+@app.route("/drinks/refresh-late", methods=["POST"])
+@require_webhook_secret
+def trigger_late_refresh():
+    """Webhook-protected endpoint to force a late-status sweep."""
+    refresh_late_statuses()
+    return jsonify({"success": True}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -355,21 +449,18 @@ def add_comment():
 @require_auth
 def toggle_like():
     data        = request.json
-    target_type = data.get("target_type")   # hr_event | comment | assignment
+    target_type = data.get("target_type")
     target_id   = data.get("target_id")
 
     profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
     username = profile_res.data["username"]
 
-    # Check if already liked
     existing = supabase.table("likes").select("id").eq("user_id", str(request.user.id)).eq("target_type", target_type).eq("target_id", target_id).execute()
 
     if existing.data:
-        # Unlike
         supabase.table("likes").delete().eq("id", existing.data[0]["id"]).execute()
         return jsonify({"liked": False}), 200
     else:
-        # Like
         supabase.table("likes").insert({
             "user_id":     str(request.user.id),
             "username":    username,
@@ -418,6 +509,7 @@ def get_vapid_public_key():
 
 @app.route("/health", methods=["GET"])
 def health():
+    refresh_late_statuses()   # piggyback late check on health pings
     return jsonify({"status": "ok", "app": "Going Yard & Drinking Hard"}), 200
 
 
