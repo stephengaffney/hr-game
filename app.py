@@ -207,25 +207,79 @@ def send_push_to_users(usernames: list, title: str, body: str, exclude: str = No
 # Late status helper — call periodically or on fetch to mark overdue drinks
 # ---------------------------------------------------------------------------
 
-def refresh_late_statuses():
-    cutoff_date = (datetime.now(timezone.utc) - timedelta(hours=LATE_HOURS)).strftime("%Y-%m-%d")
+def refresh_late_statuses(notify: bool = True):
+    """
+    Mark overdue drinks as late and optionally send push notifications.
+
+    Lateness is based on hr_triggered_at (exact HR timestamp) for i_drink
+    and pending you_drink, and assigned_at for awaiting_approval you_drink.
+
+    notify=True  → send push notifications for newly-late drinks (normal operation)
+    notify=False → silent sweep only, used on poller restart to avoid
+                   re-notifying for drinks that went late before today
+    """
+    now      = datetime.now(timezone.utc)
+    today    = now.strftime("%Y-%m-%d")
+    cutoff   = (now - timedelta(hours=LATE_HOURS)).isoformat()
+
     try:
-        overdue = (
+        # Find pending/awaiting drinks whose clock has expired
+        # We join through hr_events to get the real HR timestamp,
+        # and check assigned_at for awaiting_approval rows
+        overdue_res = (
             supabase.table("drink_log")
-            .select("id, hr_event_id, username, given_to, drink_type, mlb_player")
+            .select("id, hr_event_id, username, given_to, drink_type, mlb_player, hr_triggered_at, assigned_at, event_date")
             .in_("status", ["pending", "awaiting_approval"])
-            .lt("event_date", cutoff_date)
             .execute()
         )
-        if not overdue.data:
+        if not overdue_res.data:
             return
 
-        ids = [r["id"] for r in overdue.data]
+        newly_late = []
+        for row in overdue_res.data:
+            if row["drink_type"] == "awaiting_approval" or row.get("given_to"):
+                # Clock starts from assigned_at for you_drink assignees
+                clock_start = row.get("assigned_at") or row.get("hr_triggered_at")
+            else:
+                # Clock starts from HR timestamp for i_drink and unassigned you_drink
+                clock_start = row.get("hr_triggered_at")
+
+            if not clock_start:
+                # Fall back to noon on event_date if timestamps missing
+                clock_start = (row.get("event_date") or today) + "T12:00:00+00:00"
+
+            try:
+                start_dt = datetime.fromisoformat(clock_start.replace("Z", "+00:00"))
+                age_hours = (now - start_dt).total_seconds() / 3600
+            except Exception:
+                age_hours = 0
+
+            if age_hours >= LATE_HOURS:
+                newly_late.append(row)
+
+        if not newly_late:
+            return
+
+        ids = [r["id"] for r in newly_late]
         supabase.table("drink_log").update({"status": "late"}).in_("id", ids).execute()
         print(f"[LATE] Marked {len(ids)} drink(s) as late")
 
-        # Send one notification per newly-late drink to all users
-        for row in overdue.data:
+        if not notify:
+            print("[LATE] Silent sweep — skipping notifications")
+            return
+
+        # Only notify for drinks that went late today (avoids spam on restart)
+        for row in newly_late:
+            clock_start = row.get("assigned_at") or row.get("hr_triggered_at") or (row.get("event_date", today) + "T12:00:00+00:00")
+            try:
+                start_dt   = datetime.fromisoformat(clock_start.replace("Z", "+00:00"))
+                late_since  = start_dt + timedelta(hours=LATE_HOURS)
+                # Only notify if the drink crossed the late threshold today
+                if late_since.strftime("%Y-%m-%d") != today:
+                    continue
+            except Exception:
+                continue
+
             drinker = (row.get("given_to") or row["username"]).capitalize()
             player  = row.get("mlb_player", "a player")
             send_push_to_all(
@@ -283,13 +337,14 @@ def hr_webhook():
     # Insert drink log entry — always starts as 'pending'
     try:
         supabase.table("drink_log").insert({
-            "hr_event_id": event_id,
-            "event_date":  datetime.now().strftime("%Y-%m-%d"),
-            "username":    drinker,
-            "mlb_player":  full_name,
-            "drink_type":  drink_type,
-            "given_to":    None,
-            "status":      "pending",
+            "hr_event_id":     event_id,
+            "event_date":      datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "hr_triggered_at": datetime.now(timezone.utc).isoformat(),
+            "username":        drinker,
+            "mlb_player":      full_name,
+            "drink_type":      drink_type,
+            "given_to":        None,
+            "status":          "pending",
         }).execute()
     except Exception as e:
         print(f"[DB] Failed to insert drink_log: {e}")
@@ -309,8 +364,8 @@ def hr_webhook():
         "drinker":    drinker,
     })
 
-    # Refresh any newly-late drinks while we're here
-    refresh_late_statuses()
+    # Refresh any newly-late drinks while we're here — with notifications
+    refresh_late_statuses(notify=True)
 
     return jsonify({"success": True, "event_id": event_id}), 201
 
@@ -366,8 +421,9 @@ def assign_drink():
     # Update drink_log: set given_to and move to awaiting_approval
     try:
         supabase.table("drink_log").update({
-            "given_to": assignee,
-            "status":   "awaiting_approval",
+            "given_to":    assignee,
+            "status":      "awaiting_approval",
+            "assigned_at": datetime.now(timezone.utc).isoformat(),
         }).eq("hr_event_id", hr_event_id).execute()
     except Exception as e:
         print(f"[DB] Failed to update drink_log: {e}")
@@ -671,7 +727,9 @@ def get_vapid_public_key():
 
 @app.route("/health", methods=["GET"])
 def health():
-    refresh_late_statuses()   # piggyback late check on health pings
+    # Silent sweep — don't notify on health pings to avoid
+    # re-notifying for drinks that went late before today on restart
+    refresh_late_statuses(notify=False)
     return jsonify({"status": "ok", "app": "Going Yard & Drinking Hard"}), 200
 
 
