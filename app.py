@@ -154,6 +154,56 @@ def send_push_to_all(title: str, body: str, data: dict = None):
 
 
 # ---------------------------------------------------------------------------
+# Targeted push — send only to specific usernames, excluding the actor
+# ---------------------------------------------------------------------------
+
+def send_push_to_users(usernames: list, title: str, body: str, exclude: str = None, data: dict = None):
+    if not VAPID_PRIVATE_KEY:
+        return
+    if not usernames:
+        return
+
+    targets = [u.lower() for u in usernames if u and u.lower() != (exclude or "").lower()]
+    if not targets:
+        return
+
+    try:
+        subs = supabase.table("push_subscriptions").select("*").in_("username", targets).execute()
+    except Exception as e:
+        print(f"[PUSH] Could not fetch subscriptions: {e}")
+        return
+
+    if not subs.data:
+        return
+
+    payload = json.dumps({"title": title, "body": body, "data": data or {}})
+
+    for sub in subs.data:
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub["endpoint"],
+                    "keys": {"p256dh": sub["p256dh"], "auth": sub["auth_key"]},
+                },
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={
+                    "sub": VAPID_EMAIL,
+                    "exp": int(datetime.now(timezone.utc).timestamp()) + 86400,
+                },
+                content_encoding="aes128gcm",
+            )
+            print(f"[PUSH] Sent to {sub['username']}")
+        except WebPushException as e:
+            if e.response and e.response.status_code == 410:
+                supabase.table("push_subscriptions").delete().eq("endpoint", sub["endpoint"]).execute()
+            else:
+                print(f"[PUSH] Failed for {sub['username']}: {e}")
+        except Exception as e:
+            print(f"[PUSH] Unexpected error for {sub['username']}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Late status helper — call periodically or on fetch to mark overdue drinks
 # ---------------------------------------------------------------------------
 
@@ -437,9 +487,28 @@ def add_comment():
             "username":    username,
             "body":        body,
         }).execute()
-        return jsonify(res.data[0]), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+    # Notify drinker(s) — not the commenter themselves
+    try:
+        event = supabase.table("hr_events").select("drinker, drink_type").eq("id", hr_event_id).single().execute().data
+        dl    = supabase.table("drink_log").select("given_to").eq("hr_event_id", hr_event_id).maybeSingle().execute().data
+        notify_users = set()
+        notify_users.add(event["drinker"])
+        if event["drink_type"] == "you_drink" and dl and dl.get("given_to"):
+            notify_users.add(dl["given_to"])
+        send_push_to_users(
+            list(notify_users),
+            "💬 New Comment",
+            f"{username.capitalize()} left a comment",
+            exclude=username,
+            data={"type": "comment", "hr_event_id": hr_event_id}
+        )
+    except Exception as e:
+        print(f"[PUSH] Comment notify failed: {e}")
+
+    return jsonify(res.data[0]), 201
 
 
 # ---------------------------------------------------------------------------
@@ -461,14 +530,79 @@ def toggle_like():
     if existing.data:
         supabase.table("likes").delete().eq("id", existing.data[0]["id"]).execute()
         return jsonify({"liked": False}), 200
-    else:
-        supabase.table("likes").insert({
-            "user_id":     str(request.user.id),
-            "username":    username,
-            "target_type": target_type,
-            "target_id":   target_id,
-        }).execute()
-        return jsonify({"liked": True}), 200
+
+    supabase.table("likes").insert({
+        "user_id":     str(request.user.id),
+        "username":    username,
+        "target_type": target_type,
+        "target_id":   target_id,
+    }).execute()
+
+    # Notify relevant users for hr_event likes only
+    if target_type == "hr_event":
+        try:
+            event = supabase.table("hr_events").select("drinker, drink_type").eq("id", target_id).single().execute().data
+            dl    = supabase.table("drink_log").select("given_to").eq("hr_event_id", target_id).maybeSingle().execute().data
+            assignee = dl.get("given_to") if dl else None
+
+            if event["drink_type"] == "i_drink":
+                send_push_to_users(
+                    [event["drinker"]],
+                    "⚾ Cheers!",
+                    f"{username.capitalize()} says cheers!",
+                    exclude=username,
+                    data={"type": "like", "hr_event_id": target_id}
+                )
+            else:
+                send_push_to_users(
+                    [event["drinker"]],
+                    "⚾ Nice one!",
+                    f"{username.capitalize()} says nice one!",
+                    exclude=username,
+                    data={"type": "like", "hr_event_id": target_id}
+                )
+                if assignee:
+                    send_push_to_users(
+                        [assignee],
+                        "⚾ Bottoms up!",
+                        f"{username.capitalize()} says bottoms up!",
+                        exclude=username,
+                        data={"type": "like", "hr_event_id": target_id}
+                    )
+        except Exception as e:
+            print(f"[PUSH] Like notify failed: {e}")
+
+    return jsonify({"liked": True}), 200
+
+
+# ---------------------------------------------------------------------------
+# Video upload notification
+# ---------------------------------------------------------------------------
+
+@app.route("/videos/notify", methods=["POST"])
+@require_auth
+def notify_video_upload():
+    data        = request.json
+    hr_event_id = data.get("hr_event_id")
+    player_name = data.get("player_name", "")
+
+    profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
+    uploader = profile_res.data["username"]
+
+    try:
+        subs = supabase.table("push_subscriptions").select("username").execute()
+        targets = [s["username"] for s in (subs.data or [])]
+        send_push_to_users(
+            targets,
+            "🎥 New Chug Video!",
+            f"{uploader.capitalize()} uploaded their chug for {player_name}'s homer!",
+            exclude=uploader,
+            data={"type": "video", "hr_event_id": hr_event_id}
+        )
+    except Exception as e:
+        print(f"[PUSH] Video notify failed: {e}")
+
+    return jsonify({"success": True}), 200
 
 
 # ---------------------------------------------------------------------------
