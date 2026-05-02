@@ -226,10 +226,12 @@ def refresh_late_statuses(notify: bool = True):
         # Find pending/awaiting drinks whose clock has expired
         # We join through hr_events to get the real HR timestamp,
         # and check assigned_at for awaiting_approval rows
+        one_week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
         overdue_res = (
             supabase.table("drink_log")
             .select("id, hr_event_id, username, given_to, drink_type, mlb_player, hr_triggered_at, assigned_at, event_date")
             .in_("status", ["pending", "awaiting_approval"])
+            .gte("event_date", one_week_ago)
             .execute()
         )
         if not overdue_res.data:
@@ -237,9 +239,12 @@ def refresh_late_statuses(notify: bool = True):
 
         newly_late = []
         for row in overdue_res.data:
-            if row["drink_type"] == "awaiting_approval" or row.get("given_to"):
-                # Clock starts from assigned_at for you_drink assignees
-                clock_start = row.get("assigned_at") or row.get("hr_triggered_at")
+            if row["status"] == "awaiting_approval" and row.get("assigned_at"):
+                # Clock starts from assigned_at for assigned you_drink
+                clock_start = row.get("assigned_at")
+            elif row.get("given_to") and row.get("assigned_at"):
+                # Also use assigned_at if drink has been assigned
+                clock_start = row.get("assigned_at")
             else:
                 # Clock starts from HR timestamp for i_drink and unassigned you_drink
                 clock_start = row.get("hr_triggered_at")
@@ -437,7 +442,7 @@ def assign_drink():
             "🍺 Drink Assigned!",
             f"{username.capitalize()} assigned a drink to {assignee.capitalize()}! \"{message}\"",
             exclude=username,
-            data={"type": "assignment", "assignment_id": assignment_id}
+            data={"type": "assignment", "assignment_id": assignment_id, "hr_event_id": hr_event_id}
         )
     except Exception as e:
         print(f"[PUSH] Assignment notify failed: {e}")
@@ -520,7 +525,7 @@ def approve_drink():
             "✅ Drink Confirmed!",
             f"{approver.capitalize()} approved {drinker_display}'s drink. Bottoms up! 🍺",
             exclude=approver,
-            data={"type": "approval", "drink_log_id": drink_log_id}
+            data={"type": "approval", "drink_log_id": drink_log_id, "hr_event_id": dl.get("hr_event_id")}
         )
     except Exception as e:
         print(f"[PUSH] Approval notify failed: {e}")
