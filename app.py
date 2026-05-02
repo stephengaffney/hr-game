@@ -710,6 +710,55 @@ def notify_video_upload():
 
 
 # ---------------------------------------------------------------------------
+# Video auto-cleanup — rolling cap of 10 most recent videos
+# ---------------------------------------------------------------------------
+
+@app.route("/videos/cleanup", methods=["POST"])
+@require_auth
+def cleanup_videos():
+    """
+    Called before each new video upload.
+    Deletes the oldest video(s) from both Supabase Storage and chug_videos
+    until the total count is below MAX_VIDEOS, making room for the new upload.
+    """
+    MAX_VIDEOS = 10
+
+    try:
+        # Fetch all videos ordered oldest first
+        res = supabase.table("chug_videos").select("id, storage_path").order("created_at", desc=False).execute()
+        videos = res.data or []
+    except Exception as e:
+        print(f"[CLEANUP] Failed to fetch videos: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    # How many need to be deleted to bring count to MAX_VIDEOS - 1 (room for new one)
+    to_delete_count = max(0, len(videos) - (MAX_VIDEOS - 1))
+
+    if to_delete_count == 0:
+        return jsonify({"success": True, "deleted": 0}), 200
+
+    to_delete = videos[:to_delete_count]
+    deleted   = 0
+
+    for video in to_delete:
+        # Delete from Supabase Storage
+        try:
+            supabase.storage.from_("chug-videos").remove([video["storage_path"]])
+        except Exception as e:
+            print(f"[CLEANUP] Storage delete failed for {video['storage_path']}: {e}")
+
+        # Delete from chug_videos table
+        try:
+            supabase.table("chug_videos").delete().eq("id", video["id"]).execute()
+            deleted += 1
+            print(f"[CLEANUP] Deleted video id={video['id']}")
+        except Exception as e:
+            print(f"[CLEANUP] DB delete failed for id={video['id']}: {e}")
+
+    return jsonify({"success": True, "deleted": deleted}), 200
+
+
+# ---------------------------------------------------------------------------
 # Push subscription management
 # ---------------------------------------------------------------------------
 
