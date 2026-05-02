@@ -412,7 +412,7 @@ def approve_drink():
     except Exception:
         return jsonify({"error": "Drink log entry not found"}), 404
 
-    if dl["status"] == "completed":
+    if dl["status"] in ("completed", "completed_late"):
         return jsonify({"success": True, "message": "Already completed"}), 200
 
     # Who is the actual drinker for this entry?
