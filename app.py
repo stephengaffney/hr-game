@@ -370,10 +370,11 @@ def approve_drink():
     if approver == actual_drinker:
         return jsonify({"error": "You cannot approve your own drink"}), 403
 
-    # Mark completed
+    # Mark completed — if it was already late, mark as completed_late
+    final_status = "completed_late" if dl["status"] == "late" else "completed"
     try:
         supabase.table("drink_log").update({
-            "status":      "completed",
+            "status":      final_status,
             "approved_by": approver,
             "approved_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", drink_log_id).execute()
