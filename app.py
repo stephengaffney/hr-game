@@ -358,10 +358,10 @@ def hr_webhook():
         push_body  = f"{slogan} {drinker.capitalize()} must assign {count} {beer_word}!"
 
     send_push_to_all(push_title, push_body, {
-        "event_id":   event_id,
-        "player_key": player_key,
-        "drink_type": drink_type,
-        "drinker":    drinker,
+        "hr_event_id": event_id,
+        "player_key":  player_key,
+        "drink_type":  drink_type,
+        "drinker":     drinker,
     })
 
     # Refresh any newly-late drinks while we're here — with notifications
