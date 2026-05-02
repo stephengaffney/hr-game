@@ -208,26 +208,32 @@ def send_push_to_users(usernames: list, title: str, body: str, exclude: str = No
 # ---------------------------------------------------------------------------
 
 def refresh_late_statuses():
-    """
-    Finds all drink_log entries that are still pending/awaiting_approval
-    and have been open for more than LATE_HOURS. Marks them as 'late'.
-
-    drink_log has no created_at — we compare event_date (DATE string)
-    against today's date minus LATE_HOURS (i.e. yesterday).
-    """
     cutoff_date = (datetime.now(timezone.utc) - timedelta(hours=LATE_HOURS)).strftime("%Y-%m-%d")
     try:
         overdue = (
             supabase.table("drink_log")
-            .select("id, hr_event_id, username")
+            .select("id, hr_event_id, username, given_to, drink_type, mlb_player")
             .in_("status", ["pending", "awaiting_approval"])
             .lt("event_date", cutoff_date)
             .execute()
         )
-        if overdue.data:
-            ids = [r["id"] for r in overdue.data]
-            supabase.table("drink_log").update({"status": "late"}).in_("id", ids).execute()
-            print(f"[LATE] Marked {len(ids)} drink(s) as late")
+        if not overdue.data:
+            return
+
+        ids = [r["id"] for r in overdue.data]
+        supabase.table("drink_log").update({"status": "late"}).in_("id", ids).execute()
+        print(f"[LATE] Marked {len(ids)} drink(s) as late")
+
+        # Send one notification per newly-late drink to all users
+        for row in overdue.data:
+            drinker = (row.get("given_to") or row["username"]).capitalize()
+            player  = row.get("mlb_player", "a player")
+            send_push_to_all(
+                "🔴 Late Drink!",
+                f"{drinker} hasn't drank for {player}'s homer yet — 24 hours are up!",
+                {"type": "late", "hr_event_id": row.get("hr_event_id")}
+            )
+
     except Exception as e:
         print(f"[LATE] Error refreshing late statuses: {e}")
 
