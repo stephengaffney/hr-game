@@ -512,6 +512,25 @@ def add_comment():
     return jsonify(res.data[0]), 201
 
 
+@app.route("/comments/<int:comment_id>", methods=["DELETE"])
+@require_auth
+def delete_comment(comment_id):
+    profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
+    username = profile_res.data["username"]
+
+    # Verify the comment belongs to the requesting user
+    try:
+        comment = supabase.table("comments").select("username").eq("id", comment_id).single().execute()
+    except Exception:
+        return jsonify({"error": "Comment not found"}), 404
+
+    if comment.data["username"].lower() != username.lower():
+        return jsonify({"error": "You can only delete your own comments"}), 403
+
+    supabase.table("comments").delete().eq("id", comment_id).execute()
+    return jsonify({"success": True}), 200
+
+
 # ---------------------------------------------------------------------------
 # Likes
 # ---------------------------------------------------------------------------
