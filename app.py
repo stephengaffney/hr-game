@@ -428,11 +428,19 @@ def assign_drink():
     except Exception as e:
         print(f"[DB] Failed to update drink_log: {e}")
 
-    send_push_to_all(
-        "🍺 Drink Assigned!",
-        f"{username.capitalize()} assigned a drink to {assignee.capitalize()}! \"{message}\"",
-        {"type": "assignment", "assignment_id": assignment_id}
-    )
+    # Notify everyone except the assigner
+    try:
+        subs = supabase.table("push_subscriptions").select("username").execute()
+        targets = [s["username"] for s in (subs.data or [])]
+        send_push_to_users(
+            targets,
+            "🍺 Drink Assigned!",
+            f"{username.capitalize()} assigned a drink to {assignee.capitalize()}! \"{message}\"",
+            exclude=username,
+            data={"type": "assignment", "assignment_id": assignment_id}
+        )
+    except Exception as e:
+        print(f"[PUSH] Assignment notify failed: {e}")
 
     return jsonify({"success": True, "assignment_id": assignment_id}), 201
 
@@ -502,13 +510,20 @@ def approve_drink():
     except Exception as e:
         print(f"[DB] Failed to update drink_assignment status: {e}")
 
-    # Notify everyone
+    # Notify everyone except the approver
     drinker_display = actual_drinker.capitalize()
-    send_push_to_all(
-        "✅ Drink Confirmed!",
-        f"{approver.capitalize()} approved {drinker_display}'s drink. Bottoms up! 🍺",
-        {"type": "approval", "drink_log_id": drink_log_id}
-    )
+    try:
+        subs = supabase.table("push_subscriptions").select("username").execute()
+        targets = [s["username"] for s in (subs.data or [])]
+        send_push_to_users(
+            targets,
+            "✅ Drink Confirmed!",
+            f"{approver.capitalize()} approved {drinker_display}'s drink. Bottoms up! 🍺",
+            exclude=approver,
+            data={"type": "approval", "drink_log_id": drink_log_id}
+        )
+    except Exception as e:
+        print(f"[PUSH] Approval notify failed: {e}")
 
     return jsonify({"success": True, "approved_by": approver}), 200
 
