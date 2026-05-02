@@ -492,26 +492,13 @@ def add_comment():
 
     # Notify drinker(s) — not the commenter themselves
     try:
-        event = supabase.table("hr_events") \
-            .select("drinker, drink_type") \
-            .eq("id", hr_event_id) \
-            .single() \
-            .execute().data
-    
-        dl_res = supabase.table("drink_log") \
-            .select("given_to") \
-            .eq("hr_event_id", hr_event_id) \
-            .limit(1) \
-            .execute()
-    
-        dl = dl_res.data[0] if dl_res.data else None
-    
+        event = supabase.table("hr_events").select("drinker, drink_type").eq("id", hr_event_id).single().execute().data
+        dl_res = supabase.table("drink_log").select("given_to").eq("hr_event_id", hr_event_id).execute()
+        dl    = dl_res.data[0] if dl_res.data else None
         notify_users = set()
         notify_users.add(event["drinker"])
-    
         if event["drink_type"] == "you_drink" and dl and dl.get("given_to"):
             notify_users.add(dl["given_to"])
-    
         send_push_to_users(
             list(notify_users),
             "💬 New Comment",
@@ -519,9 +506,10 @@ def add_comment():
             exclude=username,
             data={"type": "comment", "hr_event_id": hr_event_id}
         )
-    
     except Exception as e:
         print(f"[PUSH] Comment notify failed: {e}")
+
+    return jsonify(res.data[0]), 201
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +543,8 @@ def toggle_like():
     if target_type == "hr_event":
         try:
             event = supabase.table("hr_events").select("drinker, drink_type").eq("id", target_id).single().execute().data
-            dl    = supabase.table("drink_log").select("given_to").eq("hr_event_id", target_id).maybeSingle().execute().data
+            dl_res = supabase.table("drink_log").select("given_to").eq("hr_event_id", target_id).execute()
+            dl    = dl_res.data[0] if dl_res.data else None
             assignee = dl.get("given_to") if dl else None
 
             if event["drink_type"] == "i_drink":
