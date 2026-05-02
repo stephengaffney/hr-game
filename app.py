@@ -668,6 +668,7 @@ def notify_video_upload():
     data        = request.json
     hr_event_id = data.get("hr_event_id")
     player_name = data.get("player_name", "")
+    video_id    = data.get("video_id")      # chug_videos.id for direct deep link
 
     profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
     uploader = profile_res.data["username"]
@@ -680,7 +681,7 @@ def notify_video_upload():
             "🎥 New Chug Video!",
             f"{uploader.capitalize()} uploaded their chug for {player_name}'s homer!",
             exclude=uploader,
-            data={"type": "video", "hr_event_id": hr_event_id}
+            data={"type": "video", "hr_event_id": hr_event_id, "video_id": video_id}
         )
     except Exception as e:
         print(f"[PUSH] Video notify failed: {e}")
