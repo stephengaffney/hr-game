@@ -495,8 +495,28 @@ def approve_drink():
     if approver == actual_drinker:
         return jsonify({"error": "You cannot approve your own drink"}), 403
 
-    # Mark completed — if it was already late, mark as completed_late
-    final_status = "completed_late" if dl["status"] == "late" else "completed"
+    # Mark completed — if the drink is overdue (by DB status OR by elapsed time),
+    # mark as completed_late if finished after 24 hours or DB status. We check the timestamp directly because the backend
+    # late-sweep may not have run yet, leaving the row as "pending" or
+    # "awaiting_approval" even though 24 hours have elapsed.
+    is_late = dl["status"] == "late"
+    if not is_late:
+        clock_start = None
+        if dl["status"] == "awaiting_approval" and dl.get("assigned_at"):
+            clock_start = dl.get("assigned_at")
+        elif dl.get("given_to") and dl.get("assigned_at"):
+            clock_start = dl.get("assigned_at")
+        else:
+            clock_start = dl.get("hr_triggered_at")
+        if clock_start:
+            try:
+                start_dt = datetime.fromisoformat(clock_start.replace("Z", "+00:00"))
+                age_hours = (datetime.now(timezone.utc) - start_dt).total_seconds() / 3600
+                if age_hours >= LATE_HOURS:
+                    is_late = True
+            except Exception:
+                pass
+    final_status = "completed_late" if is_late else "completed"
     try:
         supabase.table("drink_log").update({
             "status":      final_status,
