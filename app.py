@@ -133,8 +133,29 @@ def _push_subs_for_users(usernames: list) -> list:
         return []
 
 
+def _bulk_push_prefs(usernames: list, notif_type: str) -> dict:
+    """
+    Bulk-fetch notification preferences for a list of usernames and a single type.
+    Returns { username_lower: bool } — defaults to True if no row exists.
+    """
+    if not usernames or not notif_type:
+        return {u.lower(): True for u in usernames}
+    try:
+        targets = [u.lower() for u in usernames]
+        res = (supabase.table("notification_preferences")
+               .select("username, enabled")
+               .in_("username", targets)
+               .eq("type", notif_type)
+               .execute())
+        saved = {r["username"].lower(): bool(r["enabled"]) for r in (res.data or [])}
+        # Default missing users to True
+        return {u: saved.get(u, True) for u in targets}
+    except Exception:
+        return {u.lower(): True for u in usernames}
+
+
 def _user_wants_push(username: str, notif_type: str) -> bool:
-    """Check notification_preferences table. Defaults to True if no row exists."""
+    """Single-user preference check — used only when bulk fetch isn't practical."""
     try:
         res = (supabase.table("notification_preferences")
                .select("enabled")
@@ -161,9 +182,14 @@ def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str =
     if not subs.data:
         return
 
+    # Bulk-fetch preferences for all subscribers in one query
+    usernames = [s["username"] for s in subs.data]
+    prefs = _bulk_push_prefs(usernames, notif_type) if notif_type else {}
+
     payload = json.dumps({"title": title, "body": body, "data": data or {}})
     for sub in subs.data:
-        if notif_type and not _user_wants_push(sub["username"], notif_type):
+        uname = sub["username"].lower()
+        if notif_type and not prefs.get(uname, True):
             continue
         try:
             _send_push(sub, payload)
@@ -189,9 +215,14 @@ def send_push_to_users(usernames: list, title: str, body: str, exclude: str = No
     subs = _push_subs_for_users(targets)
     if not subs:
         return
+
+    # Bulk-fetch preferences in one query
+    prefs = _bulk_push_prefs(targets, notif_type) if notif_type else {}
+
     payload = json.dumps({"title": title, "body": body, "data": data or {}})
     for sub in subs:
-        if notif_type and not _user_wants_push(sub["username"], notif_type):
+        uname = sub["username"].lower()
+        if notif_type and not prefs.get(uname, True):
             continue
         try:
             _send_push(sub, payload)
@@ -226,8 +257,11 @@ def send_push_targeted(targets_with_bodies: list, title: str, data: dict = None,
     subs = _push_subs_for_users(usernames)
     sub_map = {s["username"].lower(): s for s in subs}
 
+    # Bulk-fetch preferences in one query
+    prefs = _bulk_push_prefs(usernames, notif_type) if notif_type else {}
+
     for username, body in unique:
-        if notif_type and not _user_wants_push(username, notif_type):
+        if notif_type and not prefs.get(username, True):
             continue
         sub = sub_map.get(username)
         if not sub:
@@ -698,6 +732,32 @@ def delete_comment(comment_id):
     return jsonify({"success": True}), 200
 
 
+@app.route("/comments/<int:comment_id>/edit", methods=["PATCH"])
+@require_auth
+def edit_comment(comment_id):
+    profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
+    username = profile_res.data["username"]
+
+    data = request.json or {}
+    body = data.get("body", "").strip()
+    if not body:
+        return jsonify({"error": "Comment body required"}), 400
+
+    try:
+        comment = supabase.table("comments").select("username").eq("id", comment_id).single().execute()
+    except Exception:
+        return jsonify({"error": "Comment not found"}), 404
+
+    if comment.data["username"].lower() != username.lower():
+        return jsonify({"error": "You can only edit your own comments"}), 403
+
+    supabase.table("comments").update({
+        "body":      body,
+        "edited_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", comment_id).execute()
+    return jsonify({"success": True}), 200
+
+
 # ---------------------------------------------------------------------------
 # Likes
 # ---------------------------------------------------------------------------
@@ -920,6 +980,32 @@ def delete_video_comment(comment_id):
         return jsonify({"error": "You can only delete your own comments"}), 403
 
     supabase.table("comments").delete().eq("id", comment_id).execute()
+    return jsonify({"success": True}), 200
+
+
+@app.route("/video-comments/<int:comment_id>/edit", methods=["PATCH"])
+@require_auth
+def edit_video_comment(comment_id):
+    profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
+    username = profile_res.data["username"]
+
+    data = request.json or {}
+    body = data.get("body", "").strip()
+    if not body:
+        return jsonify({"error": "Comment body required"}), 400
+
+    try:
+        comment = supabase.table("comments").select("username").eq("id", comment_id).single().execute()
+    except Exception:
+        return jsonify({"error": "Comment not found"}), 404
+
+    if comment.data["username"].lower() != username.lower():
+        return jsonify({"error": "You can only edit your own comments"}), 403
+
+    supabase.table("comments").update({
+        "body":      body,
+        "edited_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", comment_id).execute()
     return jsonify({"success": True}), 200
 
 
