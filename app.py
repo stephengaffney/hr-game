@@ -447,7 +447,10 @@ def hr_webhook():
             "status":          "pending",
         }).execute()
     except Exception as e:
-        print(f"[DB] Failed to insert drink_log: {e}")
+        # hr_events row exists but drink_log failed — the feed card would appear
+        # with no approve button and no way to ever complete the drink.
+        # Return 500 so the poller logs the failure and can be retried manually.
+        return jsonify({"error": f"Failed to insert drink_log: {e}"}), 500
 
     if drink_type == "i_drink":
         push_body = f"{slogan} {drinker.capitalize()} drinks {count} {beer_word}!"
@@ -502,6 +505,19 @@ def assign_drink():
     if existing.data:
         return jsonify({"error": "Drink already assigned"}), 400
 
+    # Update drink_log FIRST — if this fails we haven't created the assignment row
+    # yet, so the assigner can safely retry. Reversing this order would leave the
+    # drink stuck (assignment row exists → duplicate check blocks retry, but
+    # drink_log.given_to stays null forever).
+    try:
+        supabase.table("drink_log").update({
+            "given_to":    assignee,
+            "status":      "awaiting_approval",
+            "assigned_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("hr_event_id", hr_event_id).execute()
+    except Exception as e:
+        return jsonify({"error": f"Failed to update drink log: {e}"}), 500
+
     try:
         assign_res = supabase.table("drink_assignments").insert({
             "hr_event_id": hr_event_id,
@@ -512,16 +528,16 @@ def assign_drink():
         }).execute()
         assignment_id = assign_res.data[0]["id"]
     except Exception as e:
+        # drink_log is already updated — roll it back so the assigner can retry
+        try:
+            supabase.table("drink_log").update({
+                "given_to":    None,
+                "status":      "pending",
+                "assigned_at": None,
+            }).eq("hr_event_id", hr_event_id).execute()
+        except Exception as rollback_err:
+            print(f"[DB] Rollback failed after assignment insert error: {rollback_err}")
         return jsonify({"error": f"Failed to create assignment: {e}"}), 500
-
-    try:
-        supabase.table("drink_log").update({
-            "given_to":    assignee,
-            "status":      "awaiting_approval",
-            "assigned_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("hr_event_id", hr_event_id).execute()
-    except Exception as e:
-        print(f"[DB] Failed to update drink_log: {e}")
 
     try:
         subs = supabase.table("push_subscriptions").select("username").execute()
