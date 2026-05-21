@@ -116,7 +116,6 @@ def _send_push(sub: dict, payload: str):
             "sub": VAPID_EMAIL,
             "exp": int(datetime.now(timezone.utc).timestamp()) + 86400,
         },
-        content_encoding="aes128gcm",
     )
     return True
 
@@ -1188,6 +1187,10 @@ def subscribe_push():
     username = profile_res.data["username"]
 
     try:
+        # Remove any existing subscriptions for this user that have a different endpoint
+        # (handles iOS silently rotating the push endpoint)
+        supabase.table("push_subscriptions").delete().eq("user_id", str(request.user.id)).neq("endpoint", endpoint).execute()
+
         supabase.table("push_subscriptions").upsert({
             "user_id":  str(request.user.id),
             "username": username,
