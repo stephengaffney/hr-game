@@ -39,12 +39,54 @@ CORS(app, origins=["https://going-yard-frontend.vercel.app", "http://localhost:3
 # ---------------------------------------------------------------------------
 SUPABASE_URL          = os.environ.get("SUPABASE_URL", "https://rhqyfjikjkwrzzhttuwq.supabase.co")
 SUPABASE_SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY", "")
-VAPID_PRIVATE_KEY     = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_PRIVATE_KEY_RAW = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY      = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_EMAIL           = os.environ.get("VAPID_EMAIL", "mailto:stephengaffney7@gmail.com")
 WEBHOOK_SECRET        = os.environ.get("WEBHOOK_SECRET", "gyard_secret_2026")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# ---------------------------------------------------------------------------
+# Pre-load VAPID key at startup — handle both PEM and base64url-DER formats.
+# Railway env vars often mangle multiline PEM (collapsing \n or escaping them),
+# so we normalise here once rather than failing silently on every push.
+# ---------------------------------------------------------------------------
+from py_vapid import Vapid as _Vapid
+
+_VAPID_INSTANCE = None
+
+def _load_vapid_key(raw: str):
+    """
+    Accept the private key in any of the formats py_vapid supports:
+      * PEM  (-----BEGIN ... -----) -- possibly with literal \\n from env vars
+      * DER  base64url-encoded (no header line)
+      * Raw  32-byte base64url EC scalar
+    Returns a Vapid instance, or None on failure.
+    """
+    if not raw:
+        return None
+    # Normalise literal \n sequences that Railway sometimes inserts
+    normalised = raw.replace("\\n", "\n").strip()
+    # PEM path
+    if "BEGIN" in normalised:
+        try:
+            return _Vapid.from_pem(normalised.encode())
+        except Exception as e:
+            print(f"[VAPID] from_pem failed: {e}")
+            return None
+    # DER / raw base64url path
+    try:
+        return _Vapid.from_string(normalised)
+    except Exception as e:
+        print(f"[VAPID] from_string failed: {e}")
+        return None
+
+if VAPID_PRIVATE_KEY_RAW:
+    _VAPID_INSTANCE = _load_vapid_key(VAPID_PRIVATE_KEY_RAW)
+    if _VAPID_INSTANCE:
+        print("[VAPID] Private key loaded successfully")
+    else:
+        print("[VAPID] WARNING: private key could not be loaded — push notifications will be disabled")
 
 # ---------------------------------------------------------------------------
 # Player → user matchup
@@ -104,14 +146,16 @@ def require_auth(f):
 # ---------------------------------------------------------------------------
 
 def _send_push(sub: dict, payload: str):
-    """Send a single push. Returns True on success, False on expiry, raises on other error."""
+    """Send a single push using the pre-loaded Vapid instance."""
+    if not _VAPID_INSTANCE:
+        raise Exception("VAPID key not loaded — check VAPID_PRIVATE_KEY env var format")
     webpush(
         subscription_info={
             "endpoint": sub["endpoint"],
             "keys": {"p256dh": sub["p256dh"], "auth": sub["auth_key"]},
         },
         data=payload,
-        vapid_private_key=VAPID_PRIVATE_KEY,
+        vapid_private_key=_VAPID_INSTANCE,
         vapid_claims={
             "sub": VAPID_EMAIL,
             "exp": int(datetime.now(timezone.utc).timestamp()) + 86400,
@@ -170,8 +214,8 @@ def _user_wants_push(username: str, notif_type: str) -> bool:
 
 def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str = None):
     """Send push to all subscribed users (respecting their preferences)."""
-    if not VAPID_PRIVATE_KEY:
-        print("[PUSH] VAPID_PRIVATE_KEY not set — skipping push")
+    if not _VAPID_INSTANCE:
+        print("[PUSH] VAPID key not loaded — skipping push")
         return
     try:
         subs = supabase.table("push_subscriptions").select("*").execute()
@@ -206,7 +250,7 @@ def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str =
 def send_push_to_users(usernames: list, title: str, body: str, exclude: str = None,
                        data: dict = None, notif_type: str = None):
     """Send push to specific usernames (respecting their preferences)."""
-    if not VAPID_PRIVATE_KEY or not usernames:
+    if not _VAPID_INSTANCE or not usernames:
         return
     targets = [u.lower() for u in usernames if u and u.lower() != (exclude or "").lower()]
     if not targets:
@@ -242,7 +286,7 @@ def send_push_targeted(targets_with_bodies: list, title: str, data: dict = None,
     targets_with_bodies: list of (username, body_str) tuples.
     Respects push preferences. Deduplicates by username (first entry wins).
     """
-    if not VAPID_PRIVATE_KEY:
+    if not _VAPID_INSTANCE:
         return
     seen = set()
     unique = []
