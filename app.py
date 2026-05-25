@@ -10,6 +10,7 @@ and sends Web Push notifications to all subscribed users.
 import os
 import json
 import random
+import threading
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -48,33 +49,22 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ---------------------------------------------------------------------------
 # Pre-load VAPID key at startup — handle both PEM and base64url-DER formats.
-# Railway env vars often mangle multiline PEM (collapsing \n or escaping them),
-# so we normalise here once rather than failing silently on every push.
+# Railway env vars often mangle multiline PEM (collapsing \n or escaping them).
 # ---------------------------------------------------------------------------
 from py_vapid import Vapid as _Vapid
 
 _VAPID_INSTANCE = None
 
 def _load_vapid_key(raw: str):
-    """
-    Accept the private key in any of the formats py_vapid supports:
-      * PEM  (-----BEGIN ... -----) -- possibly with literal \\n from env vars
-      * DER  base64url-encoded (no header line)
-      * Raw  32-byte base64url EC scalar
-    Returns a Vapid instance, or None on failure.
-    """
     if not raw:
         return None
-    # Normalise literal \n sequences that Railway sometimes inserts
     normalised = raw.replace("\\n", "\n").strip()
-    # PEM path
     if "BEGIN" in normalised:
         try:
             return _Vapid.from_pem(normalised.encode())
         except Exception as e:
             print(f"[VAPID] from_pem failed: {e}")
             return None
-    # DER / raw base64url path
     try:
         return _Vapid.from_string(normalised)
     except Exception as e:
@@ -86,7 +76,7 @@ if VAPID_PRIVATE_KEY_RAW:
     if _VAPID_INSTANCE:
         print("[VAPID] Private key loaded successfully")
     else:
-        print("[VAPID] WARNING: private key could not be loaded — push notifications will be disabled")
+        print("[VAPID] WARNING: private key could not be loaded — push notifications disabled")
 
 # ---------------------------------------------------------------------------
 # Player → user matchup
@@ -146,9 +136,7 @@ def require_auth(f):
 # ---------------------------------------------------------------------------
 
 def _send_push(sub: dict, payload: str):
-    """Send a single push using the pre-loaded Vapid instance."""
-    if not _VAPID_INSTANCE:
-        raise Exception("VAPID key not loaded — check VAPID_PRIVATE_KEY env var format")
+    """Send a single push. Returns True on success, False on expiry, raises on other error."""
     webpush(
         subscription_info={
             "endpoint": sub["endpoint"],
@@ -160,6 +148,8 @@ def _send_push(sub: dict, payload: str):
             "sub": VAPID_EMAIL,
             "exp": int(datetime.now(timezone.utc).timestamp()) + 86400,
         },
+        ttl=43200,   # 12 hours — deliver even if device is offline/asleep
+        timeout=10,  # 10 second network timeout per push (not 10000s)
     )
     return True
 
@@ -212,10 +202,9 @@ def _user_wants_push(username: str, notif_type: str) -> bool:
     return True
 
 
-def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str = None):
-    """Send push to all subscribed users (respecting their preferences)."""
+def _send_push_to_all_worker(title: str, body: str, data: dict, notif_type: str):
+    """Background worker — sends push to all subscribed users."""
     if not _VAPID_INSTANCE:
-        print("[PUSH] VAPID key not loaded — skipping push")
         return
     try:
         subs = supabase.table("push_subscriptions").select("*").execute()
@@ -225,7 +214,6 @@ def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str =
     if not subs.data:
         return
 
-    # Bulk-fetch preferences for all subscribers in one query
     usernames = [s["username"] for s in subs.data]
     prefs = _bulk_push_prefs(usernames, notif_type) if notif_type else {}
 
@@ -247,21 +235,28 @@ def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str =
             print(f"[PUSH] Unexpected error for {sub['username']}: {e}")
 
 
-def send_push_to_users(usernames: list, title: str, body: str, exclude: str = None,
-                       data: dict = None, notif_type: str = None):
-    """Send push to specific usernames (respecting their preferences)."""
-    if not _VAPID_INSTANCE or not usernames:
+def send_push_to_all(title: str, body: str, data: dict = None, notif_type: str = None):
+    """Fire-and-forget push to all users — runs in a daemon thread so the
+    calling request handler returns immediately and is never blocked by slow
+    push endpoints or offline devices."""
+    if not _VAPID_INSTANCE:
+        print("[PUSH] VAPID key not loaded — skipping push")
         return
-    targets = [u.lower() for u in usernames if u and u.lower() != (exclude or "").lower()]
-    if not targets:
-        return
+    t = threading.Thread(
+        target=_send_push_to_all_worker,
+        args=(title, body, data or {}, notif_type),
+        daemon=True,
+    )
+    t.start()
+
+
+def _send_push_to_users_worker(targets: list, title: str, body: str,
+                               data: dict, notif_type: str):
+    """Background worker for send_push_to_users."""
     subs = _push_subs_for_users(targets)
     if not subs:
         return
-
-    # Bulk-fetch preferences in one query
     prefs = _bulk_push_prefs(targets, notif_type) if notif_type else {}
-
     payload = json.dumps({"title": title, "body": body, "data": data or {}})
     for sub in subs:
         uname = sub["username"].lower()
@@ -279,28 +274,27 @@ def send_push_to_users(usernames: list, title: str, body: str, exclude: str = No
             print(f"[PUSH] Unexpected error for {sub['username']}: {e}")
 
 
-def send_push_targeted(targets_with_bodies: list, title: str, data: dict = None,
-                       notif_type: str = None):
-    """
-    Send personalised push bodies to specific users.
-    targets_with_bodies: list of (username, body_str) tuples.
-    Respects push preferences. Deduplicates by username (first entry wins).
-    """
-    if not _VAPID_INSTANCE:
+def send_push_to_users(usernames: list, title: str, body: str, exclude: str = None,
+                       data: dict = None, notif_type: str = None):
+    """Fire-and-forget push to specific users — runs in a daemon thread."""
+    if not _VAPID_INSTANCE or not usernames:
         return
-    seen = set()
-    unique = []
-    for username, body in targets_with_bodies:
-        u = username.lower()
-        if u not in seen:
-            seen.add(u)
-            unique.append((u, body))
+    targets = [u.lower() for u in usernames if u and u.lower() != (exclude or "").lower()]
+    if not targets:
+        return
+    t = threading.Thread(
+        target=_send_push_to_users_worker,
+        args=(targets, title, body, data or {}, notif_type),
+        daemon=True,
+    )
+    t.start()
 
+
+def _send_push_targeted_worker(unique: list, title: str, data: dict, notif_type: str):
+    """Background worker for send_push_targeted."""
     usernames = [u for u, _ in unique]
     subs = _push_subs_for_users(usernames)
     sub_map = {s["username"].lower(): s for s in subs}
-
-    # Bulk-fetch preferences in one query
     prefs = _bulk_push_prefs(usernames, notif_type) if notif_type else {}
 
     for username, body in unique:
@@ -320,6 +314,28 @@ def send_push_targeted(targets_with_bodies: list, title: str, data: dict = None,
                 print(f"[PUSH] Failed for {username}: {e}")
         except Exception as e:
             print(f"[PUSH] Unexpected error for {username}: {e}")
+
+
+def send_push_targeted(targets_with_bodies: list, title: str, data: dict = None,
+                       notif_type: str = None):
+    """Fire-and-forget personalised push — runs in a daemon thread."""
+    if not _VAPID_INSTANCE:
+        return
+    seen = set()
+    unique = []
+    for username, body in targets_with_bodies:
+        u = username.lower()
+        if u not in seen:
+            seen.add(u)
+            unique.append((u, body))
+    if not unique:
+        return
+    t = threading.Thread(
+        target=_send_push_targeted_worker,
+        args=(unique, title, data or {}, notif_type),
+        daemon=True,
+    )
+    t.start()
 
 
 def write_notification(type: str, title: str, body: str, data: dict = None):
@@ -513,7 +529,7 @@ def hr_webhook():
         "drink_type":  drink_type,
         "drinker":     drinker,
     })
-    refresh_late_statuses(notify=True)
+    threading.Thread(target=refresh_late_statuses, args=(True,), daemon=True).start()
     return jsonify({"success": True, "event_id": event_id}), 201
 
 
