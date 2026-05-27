@@ -121,12 +121,16 @@ def _send_push(sub: dict, payload: str):
 
 
 def _push_subs_for_users(usernames: list) -> list:
-    """Fetch push subscription rows for a list of usernames."""
+    """Fetch push subscription rows for a list of usernames (case-insensitive)."""
     if not usernames:
         return []
     try:
-        res = supabase.table("push_subscriptions").select("*").in_("username", usernames).execute()
-        return res.data or []
+        # Normalise to lowercase for comparison — the DB may store any casing.
+        lower_targets = {u.lower() for u in usernames}
+        # Fetch all subscriptions and filter client-side so casing mismatches
+        # in the push_subscriptions table don't silently drop targeted pushes.
+        res = supabase.table("push_subscriptions").select("*").execute()
+        return [r for r in (res.data or []) if r["username"].lower() in lower_targets]
     except Exception as e:
         print(f"[PUSH] Could not fetch subscriptions: {e}")
         return []
@@ -334,7 +338,7 @@ def refresh_late_statuses(notify: bool = True):
         one_week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
         overdue_res = (
             supabase.table("drink_log")
-            .select("id, hr_event_id, username, given_to, drink_type, mlb_player, hr_triggered_at, assigned_at, event_date")
+            .select("id, hr_event_id, username, given_to, drink_type, mlb_player, hr_triggered_at, assigned_at, event_date, status")
             .in_("status", ["pending", "awaiting_approval"])
             .gte("event_date", one_week_ago)
             .execute()
