@@ -439,16 +439,19 @@ def hr_webhook():
         return jsonify({"error": f"Failed to insert hr_event: {e}"}), 500
 
     try:
-        supabase.table("drink_log").insert({
-            "hr_event_id":     event_id,
-            "event_date":      datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "hr_triggered_at": datetime.now(timezone.utc).isoformat(),
-            "username":        drinker,
-            "mlb_player":      full_name,
-            "drink_type":      drink_type,
-            "given_to":        None,
-            "status":          "pending",
-        }).execute()
+        # Check if a drink_log row already exists (idempotency guard)
+        existing_dl = supabase.table("drink_log").select("id").eq("hr_event_id", event_id).execute()
+        if not existing_dl.data:
+            supabase.table("drink_log").insert({
+                "hr_event_id":     event_id,
+                "event_date":      datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "hr_triggered_at": datetime.now(timezone.utc).isoformat(),
+                "username":        drinker,
+                "mlb_player":      full_name,
+                "drink_type":      drink_type,
+                "given_to":        None,
+                "status":          "pending",
+            }).execute()
     except Exception as e:
         # hr_events row exists but drink_log failed — the feed card would appear
         # with no approve button and no way to ever complete the drink.
@@ -1213,12 +1216,59 @@ def get_vapid_public_key():
 
 
 # ---------------------------------------------------------------------------
+# Orphan heal — fixes hr_events with no drink_log row
+# ---------------------------------------------------------------------------
+
+def heal_orphaned_events():
+    """
+    Find hr_events with no matching drink_log row and insert the missing row.
+    Safe to run repeatedly — already-healed rows are skipped.
+    Called on every /health check so Railway uptime pings act as a self-healing cron.
+    """
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        events_res = supabase.table("hr_events") \
+            .select("id, player_key, full_name, drink_type, drinker, created_at") \
+            .gte("created_at", cutoff).execute()
+        if not events_res.data:
+            return
+
+        logs_res = supabase.table("drink_log").select("hr_event_id").execute()
+        logged_ids = {r["hr_event_id"] for r in (logs_res.data or [])}
+
+        orphans = [e for e in events_res.data if e["id"] not in logged_ids]
+        if not orphans:
+            return
+
+        print(f"[HEAL] Found {len(orphans)} orphaned hr_event(s) — inserting missing drink_log rows")
+        for event in orphans:
+            try:
+                event_date = (event.get("created_at") or "")[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                supabase.table("drink_log").insert({
+                    "hr_event_id":     event["id"],
+                    "event_date":      event_date,
+                    "hr_triggered_at": event.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                    "username":        event["drinker"],
+                    "mlb_player":      event["full_name"],
+                    "drink_type":      event["drink_type"],
+                    "given_to":        None,
+                    "status":          "pending",
+                }).execute()
+                print(f"[HEAL] Inserted drink_log for hr_event_id={event['id']} ({event['full_name']})")
+            except Exception as e:
+                print(f"[HEAL] Failed to insert drink_log for hr_event_id={event['id']}: {e}")
+    except Exception as e:
+        print(f"[HEAL] Error during orphan heal: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
 def health():
     refresh_late_statuses(notify=False)
+    heal_orphaned_events()
     return jsonify({"status": "ok", "app": "Going Yard & Drinking Hard"}), 200
 
 
