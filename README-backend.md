@@ -1,6 +1,6 @@
 # Going Yard & Drinking Hard — Backend
 
-The Flask API powering [Going Yard & Drinking Hard](https://going-yard-frontend.vercel.app/), an MLB home run drinking game tracker built for a group of friends during the 2026 season.
+**The Flask API** powering [Going Yard & Drinking Hard](https://going-yard-frontend.vercel.app/), an MLB home run drinking game tracker built for a group of friends during the 2026 season.
 
 **Live backend:** `https://hr-game-production-140c.up.railway.app`  
 **Frontend repo:** [stephengaffney/going-yard-frontend](https://github.com/stephengaffney/going-yard-frontend)
@@ -9,7 +9,7 @@ The Flask API powering [Going Yard & Drinking Hard](https://going-yard-frontend.
 
 ## What This Is
 
-Going Yard & Drinking Hard is a real-time drinking game tied to live MLB home run data. Seven players each own two MLB players — when one hits a homer, the game owner either has to drink themselves ("I Drink") or assign a drink to someone else ("You Drink"). Everything is tracked in real time: drink status, 24-hour timers, approvals, a leaderboard, and optional chug video uploads.
+Going Yard & Drinking Hard is a real-time drinking game tied to live MLB home run data. Seven players each own two MLB players — when one hits a homer, the player-owner either has to drink themselves ("I Drink") or assign a drink to someone else ("You Drink"). Everything is tracked in real time: drink status, 24-hour timers, approvals, a leaderboard, and optional chug video uploads.
 
 This repo contains:
 - **`app.py`** — The Flask REST API deployed on Railway
@@ -124,7 +124,7 @@ __pycache__/
 2. It compares each result against `last_results.json`
 3. If a player's count has increased, `notify_hr()` fires, which:
    - Appends an entry to `game_log.json`
-   - Sends an email alert via Gmail SMTP
+   - Sends an email alert via Gmail SMTP (only to the admin for troubleshooting purposes in case of any error)
    - POSTs to `/webhook/hr` on Railway
 
 ### Restart behavior
@@ -144,7 +144,7 @@ export EMAIL_PASS="your-gmail-app-password"
 python hr_poller4.py
 ```
 
-The poller runs indefinitely. If the machine loses power or wifi, it must be restarted manually.
+The poller runs indefinitely locally on Mac desktop via a plist file (caffeinated). If the machine loses power or wifi, it must be restarted manually.
 
 ### Local persistence files
 
