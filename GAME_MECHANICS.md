@@ -48,11 +48,11 @@ It reads `splits[0].stat.homeRuns` from the response — the player's **cumulati
 Tracking cumulative totals means:
 - No need to process individual game records
 - If a player hits 2 HRs in a single game and the poller catches both in one cycle, the delta (`new_hrs - old_hrs`) correctly reflects the count — "Frank must drink 2 beers" (Should only happen during downtime considering the polling cycle is once per minute)
-- Stats inherit the MLB API's timing for when game data is finalized, typically within a few minutes of the game ending
+- Stats inherit the MLB API's timing, typically within a few minutes of the game event.
 
 ### What gets created
 
-When a new HR is detected, the backend creates two database rows:
+When a new HR is detected, the backend script creates two database rows:
 
 1. **`hr_events`** — the permanent record: player info, old and new HR counts, which game participant is affected, drink type (`i_drink` or `you_drink`), and a randomly chosen announcer slogan
 2. **`drink_log`** — the mutable tracking record that changes status as the drink progresses through its lifecycle
@@ -61,9 +61,9 @@ When a new HR is detected, the backend creates two database rows:
 
 ## Drink Types
 
-### I Drink
+### "I Drink"
 
-The game owner must drink a beer themselves.
+The player-owner must drink a beer themselves.
 
 1. HR detected → all players receive a push notification
 2. Owner drinks the beer within 24 hours
@@ -72,12 +72,12 @@ The game owner must drink a beer themselves.
 
 The 24-hour clock starts when the HR is detected.
 
-### You Drink
+### "You Drink"
 
 The game owner must assign the drink to someone else in the group.
 
 1. HR detected → all players receive a push notification
-2. Owner opens the app, taps "Assign Drink", selects a player, and optionally adds a message (e.g. "payback for last week")
+2. Owner opens the app, taps "Assign Drink", selects a player, and optionally adds a message (e.g. "payback for last week") within 24 hours of the HR event
 3. The assignee receives a personalised push notification: "You've been assigned a drink"
 4. The assignee must drink within 24 hours **of being assigned**
 5. Anyone who witnesses it taps **"I Saw Them Drink"**
@@ -146,7 +146,7 @@ HR detected
 
 Anyone in the group — except the person who is supposed to drink — can confirm a drink was consumed by tapping **"I Saw Them Drink"** on the feed card.
 
-This is deliberately an honor system with social accountability. The whole group can see the feed, comment, and call people out. There is no formal dispute mechanism.
+This is deliberately an honor system with social accountability. The whole group can see the feed, comment, and call people out. There is no formal dispute mechanism. Occasional occurences of a drink being completed on time and the approval being late will be manually updated via the database. --Maybe in the future we will add a mechanic to say "I Saw Them Drink" at the time in which the video was uplaoded?
 
 If a drink is approved after the 24-hour window has already elapsed, it is marked `completed_late` rather than `completed`. The leaderboard tracks late completions separately as a badge on each player's entry.
 
@@ -176,7 +176,7 @@ Push notifications deep-link directly into the app. Tapping one opens the app an
 Ranks all seven players by total drinks consumed. Uses a podium layout — 1st, 2nd, and 3rd on raised platforms, the rest in a flat list below. Late completion counts and vacated drink counts are shown as secondary badges on each entry. This is the primary competitive view.
 
 ### 20 HR Slugger
-A progress bar race showing how close each player's "I Drink" MLB player is to hitting 20 home runs on the season. Tracks who is being "hit hardest" by their own player throughout the year.
+A progress bar race showing how close each player's "I Drink" MLB player is to hitting 20 home runs on the season. Tracks who is on target to reach the 20HR goal.
 
 ### Big Hitter
 A bar chart of how many HRs each player's "You Drink" MLB player has accumulated. A high count here means that owner has had to assign a lot of drinks to others.
@@ -191,7 +191,7 @@ Powered by a Supabase SQL view that aggregates `drink_log` rows by `username`. T
 
 ## Chug Videos
 
-Players can record or upload a short video of themselves drinking directly in the app. This feature is admin-toggled and off by default.
+Players can record or upload a short video of themselves drinking directly in the app. This feature is admin-toggled and off by default; and can be disabled on enabled directly in the app if the user has permissions. This feature is mostly to ensure users do not drink without proof if there is a known issue with the app videos and the admin is not able to fix it immediately.
 
 Key constraints:
 - Maximum 25 seconds per video
