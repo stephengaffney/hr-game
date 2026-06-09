@@ -47,7 +47,7 @@ It reads `splits[0].stat.homeRuns` from the response — the player's **cumulati
 
 Tracking cumulative totals means:
 - No need to process individual game records
-- If a player hits 2 HRs in a single game and the poller catches both in one cycle, the delta (`new_hrs - old_hrs`) correctly reflects the count — "Frank must drink 2 beers"
+- If a player hits 2 HRs in a single game and the poller catches both in one cycle, the delta (`new_hrs - old_hrs`) correctly reflects the count — "Frank must drink 2 beers" (Should only happen during downtime considering the polling cycle is once per minute)
 - Stats inherit the MLB API's timing for when game data is finalized, typically within a few minutes of the game ending
 
 ### What gets created
