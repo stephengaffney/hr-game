@@ -10,7 +10,6 @@ and sends Web Push notifications to all subscribed users.
 import os
 import json
 import random
-import threading
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -465,31 +464,19 @@ def hr_webhook():
         push_body = f"{slogan} {drinker.capitalize()} must assign {count} {beer_word}!"
 
     push_title = f"⚾ {full_name} went yard!"
-
-    # Capture all values needed in the thread before returning the response.
-    # Push sends are blocking HTTP calls — running them in a background thread
-    # prevents Railway from timing out on the webhook response when any single
-    # push delivery is slow.
-    def _send_hr_notifications():
-        try:
-            send_push_to_all(push_title, push_body, {
-                "hr_event_id": event_id,
-                "player_key":  player_key,
-                "drink_type":  drink_type,
-                "drinker":     drinker,
-            }, notif_type="hr")
-            write_notification("hr", push_title, push_body, {
-                "hr_event_id": event_id,
-                "player_key":  player_key,
-                "drink_type":  drink_type,
-                "drinker":     drinker,
-                "actor":       None,  # HR alerts have no single actor
-            })
-            refresh_late_statuses(notify=True)
-        except Exception as e:
-            print(f"[WEBHOOK] Background notification error: {e}")
-
-    threading.Thread(target=_send_hr_notifications, daemon=True).start()
+    send_push_to_all(push_title, push_body, {
+        "hr_event_id": event_id,
+        "player_key":  player_key,
+        "drink_type":  drink_type,
+        "drinker":     drinker,
+    }, notif_type="hr")
+    write_notification("hr", push_title, push_body, {
+        "hr_event_id": event_id,
+        "player_key":  player_key,
+        "drink_type":  drink_type,
+        "drinker":     drinker,
+    })
+    refresh_late_statuses(notify=True)
     return jsonify({"success": True, "event_id": event_id}), 201
 
 
@@ -571,7 +558,7 @@ def assign_drink():
         )
         write_notification("assignment", "🍺 Drink Assigned!",
             f"{username.capitalize()} assigned a drink to {assignee.capitalize()}! \"{message}\"",
-            {"type": "assignment", "assignment_id": assignment_id, "hr_event_id": hr_event_id, "actor": username.lower()}
+            {"type": "assignment", "assignment_id": assignment_id, "hr_event_id": hr_event_id}
         )
     except Exception as e:
         print(f"[PUSH] Assignment notify failed: {e}")
@@ -654,7 +641,7 @@ def approve_drink():
         )
         write_notification("approval", "✅ Drink Confirmed!",
             f"{approver.capitalize()} approved {drinker_display}'s drink. Bottoms up! 🍺",
-            {"type": "approval", "drink_log_id": drink_log_id, "hr_event_id": dl.get("hr_event_id"), "actor": approver.lower()}
+            {"type": "approval", "drink_log_id": drink_log_id, "hr_event_id": dl.get("hr_event_id")}
         )
     except Exception as e:
         print(f"[PUSH] Approval notify failed: {e}")
@@ -671,6 +658,57 @@ def approve_drink():
 def trigger_late_refresh():
     refresh_late_statuses()
     return jsonify({"success": True}), 200
+
+
+# ---------------------------------------------------------------------------
+# Admin — manual drink_log correction (Steve only)
+# ---------------------------------------------------------------------------
+
+ADMIN_USERNAME = "steve"
+ADMIN_EDITABLE_FIELDS = {
+    "status", "given_to", "assigned_at", "hr_triggered_at", "approved_by", "approved_at",
+}
+VALID_STATUSES = {"pending", "awaiting_approval", "completed", "late", "completed_late"}
+
+
+@app.route("/admin/drink-log/<int:drink_log_id>", methods=["PATCH"])
+@require_auth
+def admin_update_drink_log(drink_log_id):
+    """
+    Manual correction tool for drink_log rows. Restricted to the admin user
+    (steve) since this bypasses all the normal assign/approve validation —
+    it's meant for fixing entries that were completed/witnessed outside the
+    app (e.g. a drink that happened on time but got approved late).
+    """
+    profile_res = supabase.table("profiles").select("username").eq("id", request.user.id).single().execute()
+    username = (profile_res.data or {}).get("username", "")
+    if username.lower() != ADMIN_USERNAME:
+        return jsonify({"error": "Not authorized"}), 403
+
+    data = request.json or {}
+    updates = {k: v for k, v in data.items() if k in ADMIN_EDITABLE_FIELDS}
+    if not updates:
+        return jsonify({"error": "No editable fields provided"}), 400
+
+    if "status" in updates and updates["status"] not in VALID_STATUSES:
+        return jsonify({"error": f"Invalid status. Must be one of: {sorted(VALID_STATUSES)}"}), 400
+
+    # Normalise blanks to null, usernames to lowercase
+    for field in ("given_to", "approved_by"):
+        if field in updates:
+            updates[field] = updates[field].lower() if updates[field] else None
+    for field in ("assigned_at", "hr_triggered_at", "approved_at"):
+        if field in updates and not updates[field]:
+            updates[field] = None
+
+    try:
+        res = supabase.table("drink_log").update(updates).eq("id", drink_log_id).execute()
+        if not res.data:
+            return jsonify({"error": "Drink log entry not found"}), 404
+        print(f"[ADMIN] {username} corrected drink_log id={drink_log_id}: {updates}")
+        return jsonify({"success": True, "drink_log": res.data[0]}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to update drink log: {e}"}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +779,7 @@ def add_comment():
             notif_type="comment",
         )
         write_notification("comment", "💬 New Comment", notif_body,
-            {"type": "comment", "hr_event_id": hr_event_id, "actor": username.lower()}
+            {"type": "comment", "hr_event_id": hr_event_id}
         )
     except Exception as e:
         print(f"[PUSH] Comment notify failed: {e}")
@@ -832,19 +870,19 @@ def toggle_like():
                     f"{username.capitalize()} says cheers!", exclude=username,
                     data={"type": "like", "hr_event_id": target_id}, notif_type="like")
                 write_notification("like", "⚾ Cheers!", f"{username.capitalize()} says cheers!",
-                    {"type": "like", "hr_event_id": target_id, "actor": username.lower()})
+                    {"type": "like", "hr_event_id": target_id})
             else:
                 send_push_to_users([event["drinker"]], "⚾ Nice one!",
                     f"{username.capitalize()} says nice one!", exclude=username,
                     data={"type": "like", "hr_event_id": target_id}, notif_type="like")
                 write_notification("like", "⚾ Nice one!", f"{username.capitalize()} says nice one!",
-                    {"type": "like", "hr_event_id": target_id, "actor": username.lower()})
+                    {"type": "like", "hr_event_id": target_id})
                 if assignee:
                     send_push_to_users([assignee], "⚾ Bottoms up!",
                         f"{username.capitalize()} says bottoms up!", exclude=username,
                         data={"type": "like", "hr_event_id": target_id}, notif_type="like")
                     write_notification("like", "⚾ Bottoms up!", f"{username.capitalize()} says bottoms up!",
-                        {"type": "like", "hr_event_id": target_id, "actor": username.lower()})
+                        {"type": "like", "hr_event_id": target_id})
         except Exception as e:
             print(f"[PUSH] Like notify failed: {e}")
 
@@ -887,7 +925,7 @@ def notify_video_upload():
         # Write one generic notification for the in-app feed
         write_notification("video", "🎥 New Chug Video!",
             f"{uploader.capitalize()} uploaded a chug for {player_name}'s homer!",
-            {**push_data, "actor": uploader.lower()}
+            push_data
         )
     except Exception as e:
         print(f"[PUSH] Video notify failed: {e}")
@@ -993,7 +1031,7 @@ def add_video_comment():
             targets.append((u, body_msg))
 
         send_push_targeted(targets, "💬 New Comment", data=push_data, notif_type="comment")
-        write_notification("comment", "💬 New Comment", notif_body_generic, {**push_data, "actor": username.lower()})
+        write_notification("comment", "💬 New Comment", notif_body_generic, push_data)
     except Exception as e:
         print(f"[PUSH] Video comment notify failed: {e}")
 
@@ -1095,7 +1133,7 @@ def toggle_video_like():
             send_push_targeted(targets, "🍺 Cheers!", data=push_data, notif_type="like")
             write_notification("like", "🍺 Cheers!",
                 f"{username.capitalize()} liked a chug for {video['player_name']}'s homer!",
-                {**push_data, "actor": username.lower()}
+                push_data
             )
     except Exception as e:
         print(f"[PUSH] Video like notify failed: {e}")
